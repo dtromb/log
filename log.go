@@ -436,7 +436,7 @@ func (ls *stdLogStream) dispatchLog(level LogLevel, generateTrace bool, setError
 			message: msg,
 		}
 		if ls.traces || ls.ctx.traces || generateTrace {
-			entry.stackTrace = generateStackTrace()
+			entry.stackTrace = GenerateStackTrace()
 		}
 		if setError != nil {
 			entry.associatedError = setError

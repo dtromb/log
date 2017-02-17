@@ -27,7 +27,7 @@ func (ste *StackTraceEntry) Function() *runtime.Func {
 	return ste.f
 }
 
-func generateStackTrace() []*StackTraceEntry {
+func GenerateStackTrace() []*StackTraceEntry {
 	trace := make([]*StackTraceEntry, 0, 16)
 	for i := 1; i < 1000; i++ {
 		pc, file, line, ok := runtime.Caller(2+i)

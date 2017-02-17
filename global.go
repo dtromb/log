@@ -1,7 +1,6 @@
 package log
 
 import (
-	"fmt"
 	"unsafe"
 	"io"
 	"syscall"
@@ -27,7 +26,7 @@ func GetGlobalLoggingContext() LoggingContext {
 		}
 		stdoutLogger := NewWriterLogger("default-stdout", os.Stdout, formatter)
 		_GLOBAL_loggingContext.AddGlobalLogListener(stdoutLogger, Trace)
-		fmt.Println("INIT")
+		//fmt.Println("INIT")
 	}
 	<-_GLOBAL_loggingContextLock 
 	return _GLOBAL_loggingContext
