@@ -2,10 +2,6 @@
 
 package support
 
-import (
-	"unsafe"
-)
-
 /*
 	#cgo pkg-config: sdl2
 	#include <SDL_log.h>
@@ -14,10 +10,10 @@ import "C"
 
 //export sdlLogOutputDispatch
 func sdlLogOutputDispatch(userdata *C.char, category C.int, pri C.SDL_LogPriority, msg *C.char) {
-	slu := (*SdlLogUserdata)(unsafe.Pointer(userdata))
+	slu := global_SdlLogUserdata
 	<-slu.lock
 	defer func() { slu.lock <- true }()
-	for ctx, _ := range slu.contexts {
+	for _, ctx := range slu.contexts {
 		<-ctx.lock
 		defer func() {
 			select {

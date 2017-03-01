@@ -14,6 +14,10 @@ func init() {
 	GetGlobalLoggingContext()
 }
 
+func IsTerminal(term io.Writer) bool {
+	return hasTerminal(term)
+}
+
 func GetGlobalLoggingContext() LoggingContext {
 	_GLOBAL_loggingContextLock <- true
 	if _GLOBAL_loggingContext == nil {

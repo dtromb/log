@@ -3,32 +3,39 @@
 package support
 
 import (
+	"time"
+	"runtime"
+	"fmt"
 	"unsafe"
 	"github.com/dtromb/log"
-	"reflect"
 )
 
 /*
-	#cgo pkg-config: sdl2
+	#cgo pkg-config: sdl2	
+	#include <SDL.h>
 	#include <SDL_log.h>
 	
 	extern sdlLogOutputDispatch(char *userdata, int category, SDL_LogPriority pri, char *msg);
-	
-	void cgo_sdl_log_output_dispatch(void *userdata, int category, SDL_LogPriority pri, const char *msg) {
+		
+	void cgo_sdl_log_output_dispatch_impl(void *userdata, int category, SDL_LogPriority pri, const char *msg) {
 		sdlLogOutputDispatch((char*)userdata, category, pri, (char*)msg);
 	}
+	SDL_LogOutputFunction cgo_sdl_log_output_dispatch = cgo_sdl_log_output_dispatch_impl;
+
+	void cgo_sdl_log(const char *msg) {
+		SDL_Log("%s", msg);
+	}
 	
+	void cgo_sdl_set_log_output_function(SDL_LogOutputFunction f, void *d) {
+		SDL_LogSetOutputFunction(f,d);
+	}
+	
+	void cgo_sdl_log_message(int category, SDL_LogPriority priority, const char *msg) {
+		SDL_LogMessage(category, priority, "%s", msg);
+	}
 
 */
 import "C"
-
-
-/*
-void SDL_LogOutputFunction(void*           userdata,
-                           int             category,
-                           SDL_LogPriority priority,
-                           const char*     message)
-*/
 
 type SdlLoggingContext struct {
 	lock chan bool
@@ -40,22 +47,36 @@ type SdlLoggingContext struct {
 	listeners map[log.LogListener]log.LogLevel
 	debugEnabled bool
 	traces bool
-	
+	handleId int
 }
 
 type SdlLogStream struct {
 	ctx *SdlLoggingContext
 	name string
+	categoryCode int
+	defaultLevel log.LogLevel
+	defaultListenerLevel log.LogLevel
+	listeners map[log.LogListener]log.LogLevel
+	traces bool
+}
+
+type sdlLogEntry struct {
+	timestamp time.Time
+	stream SdlLogContextName
+	level log.LogLevel
+	msg string
 }
 
 type SdlLogUserdata struct {
 	lock chan bool
-	contexts map[*SdlLoggingContext]bool
+	contexts map[int]*SdlLoggingContext
+	nextHandle int
 }
 
 var global_SdlLogUserdata *SdlLogUserdata = &SdlLogUserdata{
 	lock: make(chan bool, 1),
-	contexts: make(map[*SdlLoggingContext]bool),
+	contexts: make(map[int]*SdlLoggingContext),
+	nextHandle: 1,
 }
 
 func init() {
@@ -76,16 +97,25 @@ func CreateSdlLoggingContext() *SdlLoggingContext {
 		nls := &SdlLogStream{
 			ctx: ctx,
 			name: string(key),
+			categoryCode: int(key.Code()),
 		}
 		ctx.stdStreams[key] = nls
 	}
-	ptr := reflect.ValueOf(global_SdlLogUserdata).Pointer()
 	<-global_SdlLogUserdata.lock
+	ctx.handleId = global_SdlLogUserdata.nextHandle
+	global_SdlLogUserdata.nextHandle++
+	global_SdlLogUserdata.contexts[ctx.handleId] = ctx
 	defer func() { global_SdlLogUserdata.lock <- true }()
-	C.SDL_LogSetOutputFunction((*[0]byte)(C.cgo_sdl_log_output_dispatch), unsafe.Pointer(ptr))
-	global_SdlLogUserdata.contexts[ctx] = true
+	C.SDL_LogSetOutputFunction(C.cgo_sdl_log_output_dispatch, unsafe.Pointer(uintptr(ctx.handleId)))
+	runtime.SetFinalizer(ctx, clearGlobalContext)
 	ctx.lock <- true
 	return ctx
+}
+
+func clearGlobalContext(ctx *SdlLoggingContext) {
+	<-global_SdlLogUserdata.lock
+	defer func() { global_SdlLogUserdata.lock <- true }()
+	delete(global_SdlLogUserdata.contexts, ctx.handleId)
 }
 
 type SdlLogContextName string 
@@ -145,6 +175,10 @@ func (cn SdlLogContextName) Code() C.int {
 	return C.SDL_LOG_CATEGORY_CUSTOM
 }
 
+func (cn SdlLogContextName) Custom() bool {
+	return cn.Code() != C.SDL_LOG_CATEGORY_CUSTOM
+}
+
 type SdlLogPriority C.SDL_LogPriority
 const (
 	SdlLogPriorityVerbose		SdlLogPriority = C.SDL_LOG_PRIORITY_VERBOSE
@@ -196,7 +230,39 @@ func (ctx *SdlLoggingContext) getCategoryByCode(code int) (SdlLogContextName,boo
 }
 
 func (ctx *SdlLoggingContext) dispatch(streamCtxName SdlLogContextName, logLevel log.LogLevel, msg string) {
-	panic("SdlLoggingContext.dispatch() unimplemented")
+	var interested []log.LogListener
+	for listener, level := range ctx.listeners {
+		if level >= logLevel || (level == log.Default && ctx.defaultListenerLevel <= logLevel) || level == log.All {
+			interested = append(interested, listener)
+		}
+	}
+	var stream *SdlLogStream
+	if streamCtxName.Custom() {
+		st, has := ctx.customStreams[string(streamCtxName)]
+		if has {
+			stream = st.(*SdlLogStream)
+		}
+	} else {
+		stream = ctx.stdStreams[streamCtxName].(*SdlLogStream)
+	}
+	if stream != nil {
+		for listener, level := range stream.listeners {
+			if level >= logLevel || (level == log.Default && ctx.defaultListenerLevel <= logLevel) || level == log.All {
+				interested = append(interested, listener)
+			}
+		}
+	}
+	if len(interested) > 0 {
+		entry := &sdlLogEntry{
+			timestamp: time.Now(),
+			stream: streamCtxName,
+			level: logLevel,
+			msg: msg,
+		}
+		for _, l := range interested {
+			go l.Receive(entry)
+		}
+	}
 }
 
 func (ctx *SdlLoggingContext) HasStream(key string) bool {
@@ -294,39 +360,218 @@ func (ctx *SdlLoggingContext) EnableDebugging(val bool) {
 	ctx.debugEnabled = val
 }
 
-func (ls *SdlLogStream) Log(level log.LogLevel, msg string)
-func (ls *SdlLogStream) Logf(level log.LogLevel, format string, args ...interface{})
-func (ls *SdlLogStream) LogTrace(level log.LogLevel, msg string)
-func (ls *SdlLogStream) LogTracef(level log.LogLevel, format string, args ...interface{})
-func (ls *SdlLogStream) Fatal(msg string)
-func (ls *SdlLogStream) Fatalf(format string, args ...interface{})
-func (ls *SdlLogStream) FatalTrace(msg string)
-func (ls *SdlLogStream) FatalTracef(format string, args ...interface{})
-func (ls *SdlLogStream) Error(err error)
-func (ls *SdlLogStream) Errorf(err error, format string, args ...interface{})
-func (ls *SdlLogStream) Warning(msg string)
-func (ls *SdlLogStream) Warningf(format string, args ...interface{})
-func (ls *SdlLogStream) WarningTrace(msg string)
-func (ls *SdlLogStream) WarningTracef(format string, args ...interface{})
-func (ls *SdlLogStream) Info(msg string)
-func (ls *SdlLogStream) Infof(format string, args ...interface{})
-func (ls *SdlLogStream) InfoTrace(msg string)
-func (ls *SdlLogStream) InfoTracef(format string, args ...interface{})
-func (ls *SdlLogStream) Debug(msg string) 
-func (ls *SdlLogStream) Debugf(format string, args ...interface{})
-func (ls *SdlLogStream) DebugTrace(msg string) 
-func (ls *SdlLogStream) DebugTracef(format string, args ...interface{})
-func (ls *SdlLogStream) Trace(msg string)
-func (ls *SdlLogStream) Tracef(format string, args ...interface{})
-func (ls *SdlLogStream) Context() log.LoggingContext
-func (ls *SdlLogStream) Name() string
-func (ls *SdlLogStream) DefaultLogLevel() log.LogLevel
-func (ls *SdlLogStream) SetDefaultLogLevel(level log.LogLevel)
-func (ls *SdlLogStream) DefaultLogListenerLevel() log.LogLevel
-func (ls *SdlLogStream) SetDefaultLogListenerLevel(level log.LogLevel)
-func (ls *SdlLogStream) AddLogListener(logListener log.LogListener, level log.LogLevel)
-func (ls *SdlLogStream) RemoveLogListener(logListener log.LogListener)
-func (ls *SdlLogStream) TracesByDefault() bool
-func (ls *SdlLogStream) SetTracesByDefault(traces bool)
-func (ls *SdlLogStream) IsActive() bool
-func (ls *SdlLogStream) Shutdown()
+func (ls *SdlLogStream) Log(level log.LogLevel, msg string) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	pri := SdlLogPriorityForLogLevel(level)
+	var cat int
+	if stream, has := ls.ctx.stdStreams[SdlLogContextName(ls.name)]; has {
+		cat = stream.(*SdlLogStream).categoryCode
+	} else if stream, has := ls.ctx.customStreams[ls.name]; has {
+		cat = stream.(*SdlLogStream).categoryCode
+	} else {
+		return
+	}
+	C.cgo_sdl_log_message(C.int(cat), C.SDL_LogPriority(pri), C.CString(msg))
+}
+
+func (ls *SdlLogStream) Logf(level log.LogLevel, format string, args ...interface{}) {
+	ls.Log(level, fmt.Sprintf(format, args...))
+}
+
+func (ls *SdlLogStream) LogTrace(level log.LogLevel, msg string) {
+	panic("SdlLogStream.LogTrace() unimplemented")
+}
+
+func (ls *SdlLogStream) LogTracef(level log.LogLevel, format string, args ...interface{}) {
+	panic("SdlLogStream.LogTracef() unimplemented")
+}
+
+func (ls *SdlLogStream) Fatal(msg string) {
+	ls.Log(log.FatalError, msg)
+}
+
+func (ls *SdlLogStream) Fatalf(format string, args ...interface{}) {
+	ls.Logf(log.FatalError, format, args...)
+}
+
+func (ls *SdlLogStream) FatalTrace(msg string) {
+	panic("SdlLogStream.FatalTrace() unimplemented")
+}
+
+func (ls *SdlLogStream) FatalTracef(format string, args ...interface{}) {
+	panic("SdlLogStream.FatalTracef() unimplemented")
+}
+
+func (ls *SdlLogStream) Error(err error) {
+	ls.Log(log.Error, err.Error())
+}
+
+func (ls *SdlLogStream) Errorf(err error, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	msg = fmt.Sprintf("%s: %s", err.Error(), msg)
+	ls.Log(log.Error, msg)
+}
+
+func (ls *SdlLogStream) Warning(msg string) {
+	ls.Log(log.Warning, msg)
+}
+
+func (ls *SdlLogStream) Warningf(format string, args ...interface{}) {
+	ls.Warning(fmt.Sprintf(format, args...))
+}
+
+func (ls *SdlLogStream) WarningTrace(msg string) {
+	panic("SdlLogStream.WarningTrace() unimplemented")
+}
+
+func (ls *SdlLogStream) WarningTracef(format string, args ...interface{}) {
+	panic("SdlLogStream.WarningTracef() unimplemented")
+}
+
+func (ls *SdlLogStream) Info(msg string) {
+	ls.Log(log.Info, msg)
+}
+
+func (ls *SdlLogStream) Infof(format string, args ...interface{}) {
+	ls.Logf(log.Info, fmt.Sprintf(format, args...))
+}
+
+func (ls *SdlLogStream) InfoTrace(msg string) {
+	panic("SdlLogStream.InfoTrace() unimplemented")
+}
+
+func (ls *SdlLogStream) InfoTracef(format string, args ...interface{}) {
+	panic("SdlLogStream.InfoTracef() unimplemented")
+}
+
+func (ls *SdlLogStream) Debug(msg string) {
+	ls.Log(log.Debug, msg)
+}
+
+func (ls *SdlLogStream) Debugf(format string, args ...interface{}) {
+	ls.Log(log.Debug, fmt.Sprintf(format, args...))
+}
+
+func (ls *SdlLogStream) DebugTrace(msg string) {
+	panic("SdlLogStream.DebugTrace() unimplemented")
+}
+
+func (ls *SdlLogStream) DebugTracef(format string, args ...interface{}) {
+	panic("SdlLogStream.DebugTracef() unimplemented")
+}
+
+func (ls *SdlLogStream) Trace(msg string) {
+	ls.Log(log.Trace, msg)
+}
+
+func (ls *SdlLogStream) Tracef(format string, args ...interface{}) {
+	ls.Log(log.Trace, fmt.Sprintf(format, args...))
+}
+
+func (ls *SdlLogStream) Context() log.LoggingContext {
+	return ls.ctx
+}
+
+func (ls *SdlLogStream) Name() string {
+	return ls.name
+}
+
+func (ls *SdlLogStream) DefaultLogLevel() log.LogLevel {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	return ls.defaultLevel
+}
+
+func (ls *SdlLogStream) SetDefaultLogLevel(level log.LogLevel) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	ls.defaultLevel = level
+}
+
+func (ls *SdlLogStream) DefaultLogListenerLevel() log.LogLevel {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	return ls.defaultListenerLevel
+}
+
+func (ls *SdlLogStream) SetDefaultLogListenerLevel(level log.LogLevel) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	ls.defaultListenerLevel = level
+}
+
+func (ls *SdlLogStream) AddLogListener(logListener log.LogListener, level log.LogLevel) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	ls.listeners[logListener] = level
+}
+
+func (ls *SdlLogStream) RemoveLogListener(logListener log.LogListener) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	delete(ls.listeners, logListener)
+}
+
+func (ls *SdlLogStream) TracesByDefault() bool {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	return ls.traces
+}
+
+func (ls *SdlLogStream) SetTracesByDefault(traces bool) {
+	<-ls.ctx.lock
+	defer func() { ls.ctx.lock <- true }()
+	ls.traces = traces
+}
+
+func (ls *SdlLogStream) IsActive() bool {
+	return true
+}
+
+func (ls *SdlLogStream) Shutdown() {}
+
+
+func (le *sdlLogEntry) LogTime() time.Time {
+	return le.timestamp
+}
+
+func (le *sdlLogEntry) Stream() string {
+	return string(le.stream)
+}
+func (le *sdlLogEntry) Level() log.LogLevel {
+	return le.level
+}
+
+func (le *sdlLogEntry) Message() string {
+	return le.msg
+}
+
+func (le *sdlLogEntry) HasAssociatedError() bool {
+	return false
+}
+
+func (le *sdlLogEntry) AssociatedError() error {
+	return nil
+}
+
+func (le *sdlLogEntry) HasTrace() bool {
+	return false
+}
+
+func (le *sdlLogEntry) Trace() []*log.StackTraceEntry {
+	return nil
+}
+
+// test shims to work around lack of cgo support for test cases
+func test_SdlInit() {
+	C.SDL_Init(C.SDL_INIT_EVERYTHING)
+}
+
+func test_SdlLog(msg string) {
+	C.cgo_sdl_log(C.CString(msg))
+}
+
+func test_SdlQuit() {
+	C.SDL_Quit()
+}
